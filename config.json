@@ -1,0 +1,9 @@
+{
+  "guild_id": "1251864276050776096",
+  "welcome_channel_id": "1073245744171065404",
+  "goodbye_channel_id": "1073246738070130688",
+  "tiktok_username": "rlranz",
+  "notification_channel_id": "1074174786416156763",
+  "welcome_message": "Wandering around? Come in, {member}..you will be happy here!",
+  "goodbye_message": "Farewell, {member}. Hope you best on your journey.."
+}
