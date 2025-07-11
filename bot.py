@@ -4,114 +4,177 @@ import asyncio
 import json
 import os
 import feedparser
-from keep_alive import keep_alive
+import database
+from dotenv import load_dotenv
+import datetime
 
-# Load config
-with open("config.json") as f:
-    config = json.load(f)
-
+load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = discord.Object(id=int(config["guild_id"]))
-WELCOME_CHANNEL_ID = int(config["welcome_channel_id"])
-GOODBYE_CHANNEL_ID = int(config["goodbye_channel_id"])
-NOTIFY_CHANNEL_ID = int(config["notification_channel_id"])
-WELCOME_MSG = config["welcome_message"]
-GOODBYE_MSG = config["goodbye_message"]
-TIKTOK_USER = config["tiktok_username"]
 
-intents = discord.Intents.default()
-intents.members = True
+class FloppaClient(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.members = True
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.last_video_links = {}
 
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
-last_video = None
+    async def setup_hook(self):
+        await self.tree.sync()
+        self.loop.create_task(self.check_tiktok())
+        self.loop.create_task(self.check_birthdays())
+        print(f"✅ Logged in as {self.user}")
 
-@client.event
-async def on_ready():
-    await tree.sync(guild=GUILD_ID)
-    print(f"✅ Logged in as {client.user}")
+    async def check_tiktok(self):
+        await self.wait_until_ready()
+        while not self.is_closed():
+            for guild in self.guilds:
+                tiktok = database.get_tiktok(guild.id)
+                channel_id = database.get_guild_channel(guild.id, "notify")
+                channel = self.get_channel(channel_id) if channel_id else None
+                if tiktok and channel:
+                    feed_url = f"https://rsshub.app/tiktok/user/video/{tiktok}"
+                    feed = feedparser.parse(feed_url)
+                    if feed.entries:
+                        link = feed.entries[0].link
+                        if guild.id not in self.last_video_links or self.last_video_links[guild.id] != link:
+                            self.last_video_links[guild.id] = link
+                            embed = discord.Embed(title=f"🎥 New TikTok by @{tiktok}", url=link)
+                            await channel.send(embed=embed)
+            await asyncio.sleep(120)
+
+    async def check_birthdays(self):
+        await self.wait_until_ready()
+        while not self.is_closed():
+            today = datetime.datetime.utcnow().strftime("%m-%d")
+            for guild in self.guilds:
+                bchan_id = database.get_guild_channel(guild.id, "birthday")
+                if not bchan_id:
+                    continue
+                bchan = self.get_channel(bchan_id)
+                for member in guild.members:
+                    bdata = database.get_birthday(str(member.id))
+                    if bdata and bdata.get("birthday") == today:
+                        await bchan.send(f"🎉 Happy Birthday {member.mention}!")
+            await asyncio.sleep(86400)
+
+client = FloppaClient()
+tree = client.tree
 
 @client.event
 async def on_member_join(member):
-    if member.guild.id != GUILD_ID.id:
-        return
-    channel = client.get_channel(WELCOME_CHANNEL_ID)
-    if channel:
-        await channel.send(WELCOME_MSG.format(member=member.mention))
+    channel_id = database.get_guild_channel(member.guild.id, "welcome")
+    message = database.get_guild_message(member.guild.id, "welcome") or f"Welcome {member.mention}!"
+    if channel_id:
+        channel = client.get_channel(channel_id)
+        if channel:
+            await channel.send(message.format(member=member.mention))
+    database.add_user(str(member.id), member.name)
 
 @client.event
 async def on_member_remove(member):
-    if member.guild.id != GUILD_ID.id:
-        return
-    channel = client.get_channel(GOODBYE_CHANNEL_ID)
-    if channel:
-        await channel.send(GOODBYE_MSG.format(member=member.name))
+    channel_id = database.get_guild_channel(member.guild.id, "goodbye")
+    message = database.get_guild_message(member.guild.id, "goodbye") or f"Goodbye {member.name}."
+    if channel_id:
+        channel = client.get_channel(channel_id)
+        if channel:
+            await channel.send(message.format(member=member.name))
 
-@tree.command(name="ping", description="Check if the bot is online", guild=GUILD_ID)
+# --------- Slash Commands ---------
+
+@tree.command(name="ping", description="Check if bot is alive")
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("🏓 Pong!")
+    await interaction.response.send_message("🏓 Pong!", ephemeral=True)
 
-@tree.command(name="setwelcome", description="Update welcome message", guild=GUILD_ID)
-@app_commands.describe(message="Message with {member}")
-async def setwelcome(interaction: discord.Interaction, message: str):
-    global WELCOME_MSG
-    WELCOME_MSG = message
-    config["welcome_message"] = message
-    with open("config.json", "w") as f:
-        json.dump(config, f, indent=4)
-    await interaction.response.send_message("✅ Welcome message updated!")
+@tree.command(name="setchannel", description="Set a bot channel (per server)")
+@app_commands.choices(type=[
+    app_commands.Choice(name="Welcome", value="welcome"),
+    app_commands.Choice(name="Goodbye", value="goodbye"),
+    app_commands.Choice(name="Notify", value="notify"),
+    app_commands.Choice(name="Report", value="report"),
+    app_commands.Choice(name="Birthday", value="birthday")
+])
+@app_commands.describe(type="Channel type", channel="Channel to use")
+async def setchannel(interaction: discord.Interaction, type: app_commands.Choice[str], channel: discord.TextChannel):
+    database.set_guild_channel(interaction.guild.id, type.value, channel.id)
+    await interaction.response.send_message(f"✅ Set {type.name} channel to {channel.mention}", ephemeral=True)
 
-@tree.command(name="setgoodbye", description="Update goodbye message", guild=GUILD_ID)
-@app_commands.describe(message="Message with {member}")
-async def setgoodbye(interaction: discord.Interaction, message: str):
-    global GOODBYE_MSG
-    GOODBYE_MSG = message
-    config["goodbye_message"] = message
-    with open("config.json", "w") as f:
-        json.dump(config, f, indent=4)
-    await interaction.response.send_message("✅ Goodbye message updated!")
+@tree.command(name="setmessage", description="Set welcome/goodbye/warn message")
+@app_commands.choices(type=[
+    app_commands.Choice(name="Welcome", value="welcome"),
+    app_commands.Choice(name="Goodbye", value="goodbye"),
+    app_commands.Choice(name="Warn", value="warn")
+])
+@app_commands.describe(type="Message type", message="Message content with {member} or {reason}")
+async def setmessage(interaction: discord.Interaction, type: app_commands.Choice[str], message: str):
+    database.set_guild_message(interaction.guild.id, type.value, message)
+    await interaction.response.send_message(f"✅ Updated {type.name} message.", ephemeral=True)
 
-@tree.command(name="admin-speak", description="Make the bot speak in a specific channel", guild=GUILD_ID)
-@app_commands.describe(channel="Channel to speak in", message="Text to send")
-async def admin_speak(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel,
-    message: str
-):
-    if not interaction.user.guild_permissions.manage_channels:
-        await interaction.response.send_message("🚫 You need **Manage Channels** permission to use this.", ephemeral=True)
+@tree.command(name="settiktok", description="Set TikTok username")
+@app_commands.describe(username="TikTok username")
+async def settiktok(interaction: discord.Interaction, username: str):
+    database.set_tiktok(interaction.guild.id, username)
+    await interaction.response.send_message(f"✅ TikTok username set to @{username}", ephemeral=True)
+
+@tree.command(name="warn", description="Warn a user and DM them")
+@app_commands.describe(user="User to warn", reason="Reason for warning")
+async def warn(interaction: discord.Interaction, user: discord.Member, reason: str):
+    if not interaction.user.guild_permissions.kick_members:
+        await interaction.response.send_message("🚫 You don't have permission to warn.", ephemeral=True)
         return
+
+    database.add_warning(str(user.id), reason, interaction.user.name)
+    warn_msg = database.get_guild_message(interaction.guild.id, "warn")
+    if not warn_msg:
+        warn_msg = "You have been warned for: {reason}"
 
     try:
-        await channel.send(message)
-        await interaction.response.send_message(f"✅ Sent to {channel.mention}", ephemeral=True)
+        await user.send(warn_msg.format(reason=reason))
+    except:
+        pass
+
+    await interaction.response.send_message(f"⚠️ Warned {user.mention} for: {reason}", ephemeral=True)
+
+@tree.command(name="report", description="Report a user")
+@app_commands.describe(user="User to report", reason="Reason")
+async def report(interaction: discord.Interaction, user: discord.Member, reason: str):
+    channel_id = database.get_guild_channel(interaction.guild.id, "report")
+    channel = client.get_channel(channel_id) if channel_id else None
+    if not channel:
+        await interaction.response.send_message("⚠️ Report channel not set.", ephemeral=True)
+        return
+
+    report_id = f"{interaction.user.id}-{user.id}-{int(datetime.datetime.utcnow().timestamp())}"
+    database.add_report(report_id, interaction.user.id, user.id, reason)
+    embed = discord.Embed(title="🚨 New Report", color=discord.Color.red())
+    embed.add_field(name="Reporter", value=interaction.user.mention)
+    embed.add_field(name="Reported", value=user.mention)
+    embed.add_field(name="Reason", value=reason)
+    await channel.send(embed=embed)
+    await interaction.response.send_message("✅ Report sent.", ephemeral=True)
+
+@tree.command(name="kick", description="Kick a user")
+@app_commands.describe(user="User to kick", reason="Reason")
+async def kick(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
+    if not interaction.user.guild_permissions.kick_members:
+        await interaction.response.send_message("🚫 You don't have permission to kick.", ephemeral=True)
+        return
+    try:
+        await user.kick(reason=reason)
+        await interaction.response.send_message(f"✅ Kicked {user.mention} for: {reason}", ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+        await interaction.response.send_message(f"❌ Failed to kick: {e}", ephemeral=True)
 
-async def check_tiktok():
-    global last_video
-    await client.wait_until_ready()
-    channel = client.get_channel(NOTIFY_CHANNEL_ID)
-    feed_url = f"https://rsshub.app/tiktok/user/video/{TIKTOK_USER}"
-    while not client.is_closed():
-        try:
-            feed = feedparser.parse(feed_url)
-            if feed.entries:
-                latest = feed.entries[0]
-                if latest.link != last_video:
-                    last_video = latest.link
-                    embed = discord.Embed(
-                        title=f"🎥 New TikTok from @{TIKTOK_USER}",
-                        url=latest.link,
-                        description=latest.title
-                    )
-                    if "media_thumbnail" in latest:
-                        embed.set_thumbnail(url=latest.media_thumbnail[0]['url'])
-                    await channel.send(embed=embed)
-        except Exception as e:
-            print(f"[ERROR] TikTok check failed: {e}")
-        await asyncio.sleep(120)
+@tree.command(name="ban", description="Ban a user")
+@app_commands.describe(user="User to ban", reason="Reason")
+async def ban(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
+    if not interaction.user.guild_permissions.ban_members:
+        await interaction.response.send_message("🚫 You don't have permission to ban.", ephemeral=True)
+        return
+    try:
+        await user.ban(reason=reason)
+        await interaction.response.send_message(f"✅ Banned {user.mention} for: {reason}", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to ban: {e}", ephemeral=True)
 
-keep_alive()
-client.loop.create_task(check_tiktok())
 client.run(TOKEN)
